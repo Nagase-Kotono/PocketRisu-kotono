@@ -65,3 +65,6 @@ test/fixtures/
 
 # Local docker-compose overrides (machine-specific bind mounts)
 docker-compose.override.yml
+docker-compose.kotono.yml
+tailscale-config/
+.env.tailscale
