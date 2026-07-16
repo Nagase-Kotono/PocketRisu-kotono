@@ -58,3 +58,10 @@ dist.zip
 # Due to Cargo.lock makes the project build fail, we ignore it
 Cargo.lock
 test/fixtures/
+
+# oh-my-claudecode runtime state (.omc/skills/ is the committable exception)
+.omc/*
+!.omc/skills/
+
+# Local docker-compose overrides (machine-specific bind mounts)
+docker-compose.override.yml
