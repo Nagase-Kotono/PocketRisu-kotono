@@ -65,6 +65,7 @@ test/fixtures/
 
 # Local docker-compose overrides (machine-specific bind mounts)
 docker-compose.override.yml
-tailscale-config/
+tailscale-config/*
+!tailscale-config/serve.json
 .env.tailscale
 # docker-compose.kotono.yml 은 추적함 (시크릿은 .env.tailscale 로 분리)

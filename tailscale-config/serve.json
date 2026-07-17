@@ -1,0 +1,19 @@
+{
+  "TCP": {
+    "443": {
+      "HTTPS": true
+    }
+  },
+  "Web": {
+    "pocketrisu.tail534264.ts.net:443": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://127.0.0.1:6001"
+        }
+      }
+    }
+  },
+  "AllowFunnel": {
+    "pocketrisu.tail534264.ts.net:443": false
+  }
+}
