@@ -20,6 +20,7 @@ services:
       TS_SERVE_CONFIG: /config/serve.json
       TS_STATE_DIR: /var/lib/tailscale
       TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: "pocketrisu"   # MagicDNS 이름 고정. 없으면 재생성 시 컨테이너 ID가 노드명이 돼 serve URL(pocketrisu.tail534264.ts.net)이 깨짐
     volumes:
       - ts-state:/var/lib/tailscale
       - ./tailscale-config:/config
