@@ -1,0 +1,42 @@
+# PocketRisu 개인 운영 스택 (Tailscale sidecar).
+# 이 파일은 git 추적됨. 시크릿(TS_AUTHKEY)은 .env.tailscale(gitignore)로 분리.
+# 실행: docker compose -f docker-compose.kotono.yml up -d
+#
+# ★ Archive Center(장기기억 백엔드)는 이 tailscale 컨테이너(pocketrisu-ts)의
+#   network namespace를 공유해서 127.0.0.1:28080 으로 붙어요.
+#   archive-center 레포의 docker-compose.yml 을 먼저/따로 up 하세요.
+name: pocketrisu-kotono
+
+services:
+  # Tailscale sidecar — network namespace의 주인. 리수·Archive Center가 이걸 공유.
+  tailscale:
+    image: tailscale/tailscale:v1.98.8
+    container_name: pocketrisu-ts
+    restart: unless-stopped
+    env_file:
+      - .env.tailscale        # TS_AUTHKEY (시크릿, gitignore). 이미 인증됐으면 빈값이어도 OK.
+    environment:
+      TS_USERSPACE: "true"
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_AUTH_ONCE: "true"
+    volumes:
+      - ts-state:/var/lib/tailscale
+      - ./tailscale-config:/config
+    ports:
+      - 127.0.0.1:6001:6001
+
+  # PocketRisu 본체. tailscale namespace 공유 → 6001 이 ts를 통해 노출.
+  risuai:
+    image: pocketrisu-kotono:1.8.1-k1
+    restart: unless-stopped
+    network_mode: "service:tailscale"
+    volumes:
+      - /Volumes/Nagase_K/poketrisu:/app/save
+    depends_on:
+      - tailscale
+
+volumes:
+  ts-state:
+    # 기존 볼륨 이름 유지 (Tailscale 인증 상태 보존).
+    name: pocketrisu-kotono_ts-state
