@@ -33,6 +33,7 @@ services:
     network_mode: "service:tailscale"
     volumes:
       - /Volumes/Nagase_K/poketrisu:/app/save
+      - /Volumes/Nagase_K/poketrisu-backups:/app/backups-data
     depends_on:
       - tailscale
 
