@@ -99,8 +99,10 @@ git push origin main
 
 non-trivial 작업은 확정 전에 독립 리뷰어 2개로 교차 검증해요. 대상은 계획 수립 후 평가, 구현·수정 완료 후 검증, 아키텍처 결정, 버그 근본 원인 수정이에요. 한 파일 오타·포맷 수정 같은 trivial 작업은 건너뛰어요.
 
-1. **Codex 리뷰어**: leader가 `omc ask codex`로 직접 호출해요. 계획 문서나 diff를 넘겨서 비판적 평가를 받아요.
-2. **Claude 리뷰어**: Orca orchestration으로 깨끗한 Claude worker를 띄워요. 절차 — leader가 `orca orchestration task-create`로 리뷰 task를 만들고, `orca terminal create --worktree active --command "claude"`로 새 Claude 터미널을 띄운 뒤, `orca terminal wait --for tui-idle`로 준비를 기다리고, `orca orchestration dispatch --task <id> --to <handle> --inject`로 task를 전달하고, `orca orchestration check --wait --types worker_done,escalation`으로 완료를 기다려요. 진행 중인 세션 컨텍스트를 전혀 모르는 깨끗한 환경에서 critic 역할로 리뷰하게 하고, 대화 맥락 없이 산출물(계획 문서, diff, 테스트 결과)만 전달해요. Claude Code 내장 Agent tool로 서브에이전트를 띄우는 방식은 쓰지 않아요 (사용자가 Orca 앱에서 worker 터미널과 tool 호출을 직접 볼 수 있기 때문). 사용법 상세는 `orca skills get orchestration` 참조.
+리뷰어 오케스트레이션은 **Orca로만** 해요. `omc ask codex`·omc teams·Claude Code 내장 Agent tool은 쓰지 않아요 (사용자가 Orca 앱 UI에서 worker 터미널을 직접 봐야 하고, 오케스트레이션 경로를 Orca로 통일하기 때문).
+
+1. leader가 Orca orchestration으로 **독립 리뷰어 2개**를 띄워요: `orca orchestration task-create --spec ...` → `orca terminal create --worktree active --command "claude" ...` → `orca orchestration dispatch --task <id> --to <handle> --inject` → `orca orchestration check --wait --types worker_done,escalation` (상세는 `orca skills get orchestration`).
+2. 두 리뷰어는 진행 중인 세션 컨텍스트를 전혀 모르는 깨끗한 환경에서 critic 역할로 돌리고, 대화 맥락 없이 산출물(계획 문서, diff, 테스트 결과)만 전달해요. 서로 독립이어야 해요 (같은 산출물을 각자 따로 평가).
 
 두 리뷰 결과를 leader가 종합해서 지적사항을 반영하고, 둘 다 통과했을 때만 계획 확정이나 완료 선언을 해요. 두 리뷰어의 의견이 충돌하면 leader가 임의로 결정하지 말고, 상반된 의견과 각각의 근거를 정리해서 사용자에게 보고하고 결정을 받아요.
 
