@@ -5,10 +5,11 @@ import { get } from "svelte/store";
 import streamSaver from 'streamsaver';
 import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, nodeOnlyVer, getCurrentCharacter, loadTogglesFromChat } from "./storage/database.svelte";
 import { checkRisuUpdate } from "./update";
-import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore, loadingOverlayStore, chatDeselected } from "./stores.svelte";
+import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore, claimLoadingOverlay, chatDeselected } from "./stores.svelte";
 import { recordDbTransferSize } from "./transferSize";
+import { newSaveTiming, recordSaveSample, type SaveOutcome, type SaveTiming } from "./storage/saveMetrics";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertConfirm, alertError, alertMd, alertNormalWait, alertSelect, alertTOS, waitAlert, notifySuccess, notifyError, notifyInfo } from "./alert";
+import { alertConfirm, alertConfirmMulti, alertError, alertMd, alertNormalWait, alertSelect, alertTOS, waitAlert, notifySuccess, notifyError, notifyInfo } from "./alert";
 import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
@@ -53,9 +54,9 @@ import {
     extractLegacyUsage,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
 } from "./requestLog";
-import { cacheFullAssetManifest, getCachedFullAssetManifest } from './storage/assetManifestCache';
+import { createManifestItemsLoader, getCachedFullAssetManifest } from './storage/assetManifestCache';
 import { resolveNamesLocally } from './storage/assetNameLocalResolver';
-import { createAssetNameResolver, type AssetNameHit } from './storage/assetNameResolver'
+import { createAssetNameResolver, createBatchedResolve, type AssetNameHit } from './storage/assetNameResolver'
 import { addLog } from './log'
 
 export const forageStorage = new AutoStorage()
@@ -88,12 +89,7 @@ function errorMessage(error: unknown): string {
     }
 }
 
-export async function loadAssetManifestItems(manifest?: AssetManifestDescriptor): Promise<AssetManifestTuple[]> {
-    if (!manifest) return []
-    const items = await forageStorage.getAllAssetManifestItems(manifest)
-    cacheFullAssetManifest(manifest.id, items)
-    return items
-}
+export const loadAssetManifestItems = createManifestItemsLoader((manifest) => forageStorage.getAllAssetManifestItems(manifest))
 
 // One call for character + modules, answers remembered per manifest set —
 // see assetNameResolver.ts for why (module names lost to character fuzzy
@@ -106,8 +102,10 @@ export async function loadAssetManifestItems(manifest?: AssetManifestDescriptor)
 const resolveAssetNamesCached = createAssetNameResolver(async (owners, names, maxDistance) => {
     const local = resolveNamesLocally(owners, names, maxDistance)
     if (local) return local
-    return forageStorage.resolveAssetManifestNames(owners, names, maxDistance)
+    return resolveAssetNamesBatched(owners, names, maxDistance)
 })
+
+const resolveAssetNamesBatched = createBatchedResolve((owners, names, maxDistance) => forageStorage.resolveAssetManifestNames(owners, names, maxDistance))
 
 // Manifest ids (and descriptor objects — a 404 refresh rewrites the id in
 // place mid-load) already being fetched, so overlapping prefetch calls (chat
@@ -414,6 +412,8 @@ export let saving = $state({
  * 
  * @returns {Promise<void>} - A promise that resolves when the database has been saved.
  */
+// Kept for upstream parity (callers still set it). saveDb builds a fresh
+// encoder for every full write, so nothing here reads it any more.
 export let requiresFullEncoderReload = $state({
     state: false
 })
@@ -421,6 +421,8 @@ export let requiresFullEncoderReload = $state({
 let requestImmediateSaveImpl: ((options?: {
     forceFullWrite?: boolean
 }) => Promise<void> | void) = () => {}
+let flushSavesImpl: () => Promise<boolean> = async () => false
+let trackCharacterForSaveImpl: (chaId: string) => void = () => {}
 let patchSyncBaseline: Database | null = null
 let activeSavePatcher: RisuSavePatcher | null = null
 
@@ -531,6 +533,19 @@ export function requestImmediateSave(options?: {
     return requestImmediateSaveImpl(options)
 }
 
+/**
+ * Resolves true once every change made before the call has reached the
+ * server; false when saving keeps failing (the changes stay queued).
+ */
+export function flushSaves(): Promise<boolean> {
+    return flushSavesImpl()
+}
+
+/** Include this character in the next save even if nothing tracked it. */
+export function trackCharacterForSave(chaId: string) {
+    trackCharacterForSaveImpl(chaId)
+}
+
 export function setPatchSyncBaseline(data: Database | null) {
     patchSyncBaseline = data ? safeStructuredClone(data) as Database : null
 }
@@ -540,6 +555,16 @@ export async function saveDb() {
     let gotChannel = false
     const sessionID = v4()
     let saveInFlight: Promise<void> | null = null
+    // Save attempts are numbered as they start; lastSavedSeq is the latest one
+    // that ended 'saved'. flushSaves compares the two.
+    let saveSeq = 0
+    let lastSavedSeq = 0
+    // Edits are numbered as the change effects see them; savedEditSeq is the
+    // highest one a successful save started after. The difference is what a
+    // session handoff would lose (the tracker itself always keeps the
+    // selected character, so it cannot answer that).
+    let editSeq = 0
+    let savedEditSeq = 0
     const knownChatIdsByCharacter = new Map<string, Set<string>>(
         (getDatabase()?.characters ?? [])
             .filter(character => character?.chaId)
@@ -552,17 +577,85 @@ export async function saveDb() {
     if (window.BroadcastChannel) {
         channel = new BroadcastChannel('risu-db')
     }
+    // Every way this tab loses the writer role ends here. Saving stops first
+    // (gotChannel); a reload then happens as before when nothing is unsaved,
+    // otherwise only after the user chose it, with the unsaved edits
+    // downloadable first. Cancel keeps the tab open with saving paused.
+    let handoffDialogOpen = false
+    async function resolveSessionHandoff(kind: 'tab' | 'return') {
+        if (handoffDialogOpen) return
+        handoffDialogOpen = true
+        try {
+            // A save cut off by the handoff fails and stays unsaved.
+            if (saveInFlight) await saveInFlight.catch(() => {})
+            if (editSeq <= savedEditSeq) {
+                if (kind === 'return') {
+                    try { sessionStorage.setItem('risu-session-handoff-reload', '1') } catch { /* toast is best-effort */ }
+                } else {
+                    await alertNormalWait(language.activeTabChange)
+                }
+                location.reload()
+                return
+            }
+            while (true) {
+                const choice = await alertConfirmMulti(language.sessionUnsavedTitle, [
+                    language.sessionUnsavedDownload,
+                    { label: language.sessionUnsavedReload, variant: 'destructive' },
+                ], language.sessionUnsavedDetail)
+                if (choice === 0) {
+                    try {
+                        await downloadFile(`pocketrisu-unsaved-edits-${Date.now()}.json`, buildUnsavedEditsJson())
+                    } catch (error) {
+                        notifyError(error, { source: 'session-handoff' })
+                    }
+                    continue
+                }
+                if (choice === 1) {
+                    location.reload()
+                    return
+                }
+                notifyInfo(language.sessionUnsavedPaused)
+                return
+            }
+        } finally {
+            handoffDialogOpen = false
+        }
+    }
+    // What the handoff would lose, as readable JSON: the tracked characters
+    // with their loaded chats, and the root/preset/module blocks when those
+    // were edited. Not the whole DB: that can exceed the JS string limit, and
+    // chats that were never opened are only stubs here anyway.
+    function buildUnsavedEditsJson() {
+        const db = getDatabase()
+        const charIds = new Set([...changeTracker.character, ...changeTracker.chat.map(([chaId]) => chaId)])
+        const characters = (db.characters ?? [])
+            .filter((character) => character?.chaId && charIds.has(character.chaId))
+            .map((character) => ({
+                ...character,
+                chats: (character.chats ?? []).filter((chat) => chat && !chat._placeholder && !(chat as { _stub?: boolean })._stub),
+            }))
+        const out: Record<string, unknown> = { savedAt: new Date().toISOString(), characters }
+        if (changeTracker.root) {
+            const { characters: _c, botPresets: _b, modules: _m, plugins: _p, pluginCustomStorage: _s, ...root } = db
+            out.root = root
+        }
+        if (changeTracker.botPreset) out.botPresets = db.botPresets
+        if (changeTracker.modules) out.modules = db.modules
+        // Plugin settings; plugin storage values live in the server kv.
+        if (changeTracker.plugins) out.plugins = db.plugins
+        return JSON.stringify(out, null, 2)
+    }
+    const handOffSession = () => {
+        if (gotChannel) return
+        gotChannel = true
+        void resolveSessionHandoff('tab')
+    }
     if (channel) {
         channel.onmessage = (ev) => {
             if (ev.data === sessionID) {
                 return
             }
-            if (!gotChannel) {
-                gotChannel = true
-                alertNormalWait(language.activeTabChange).then(() => {
-                    location.reload()
-                })
-            }
+            handOffSession()
         }
     }
     // Cross-device single-writer lock: mirrors BroadcastChannel behavior
@@ -571,14 +664,7 @@ export async function saveDb() {
     // simultaneous use of two devices — rare, and the attempted change cannot
     // be saved — so it stays an explicit blocking modal, never an automatic
     // reload that would eat the user's action without a word.
-    window.addEventListener('risu-session-deactivated', () => {
-        if (!gotChannel) {
-            gotChannel = true
-            alertNormalWait(language.activeTabChange).then(() => {
-                location.reload()
-            })
-        }
-    })
+    window.addEventListener('risu-session-deactivated', handOffSession)
 
     // Reload-on-return: while this tab was hidden, another device may have
     // taken the writer lock and changed data. Check the moment the user comes
@@ -597,10 +683,16 @@ export async function saveDb() {
             // static import here would be circular. Already loaded → instant.
             const { doingChat } = await import("./process/index.svelte")
             if (get(doingChat)) return // never yank a running generation
+            // Already handed off (the user kept this tab open): offer the
+            // choice again instead of reloading over the unsaved edits.
+            if (gotChannel) {
+                void resolveSessionHandoff('tab')
+                return
+            }
             const state = await forageStorage.getWriterLockState()
-            if (state !== 'stale') return
-            try { sessionStorage.setItem('risu-session-handoff-reload', '1') } catch { /* toast is best-effort */ }
-            location.reload()
+            if (state !== 'stale' || gotChannel) return
+            gotChannel = true
+            await resolveSessionHandoff('return')
         })().catch(() => { /* status check failed — do nothing, write path 423 still guards */ })
     }
     window.addEventListener('focus', checkWriterLockOnReturn)
@@ -627,11 +719,6 @@ export async function saveDb() {
         // Always false: plugin values are in the server kv, not the DB.
         pluginCustomStorage: false
     }
-
-    let encoder = new RisuSaveEncoder()
-    await encoder.init(getDatabase(), {
-        compression: false
-    })
 
     let patcher = new RisuSavePatcher()
     if (supportsPatchSync) {
@@ -695,6 +782,7 @@ export async function saveDb() {
         })
 
         function saveTimeoutExecute() {
+            editSeq++
             if (saveTimeout) {
                 clearTimeout(saveTimeout);
             }
@@ -781,6 +869,16 @@ export async function saveDb() {
             for (const previousCharacterId of knownCharacterIds) {
                 if (!currentCharacterIdSet.has(previousCharacterId)) {
                     changeTracker.character = [previousCharacterId, ...changeTracker.character.filter((v) => v !== previousCharacterId)]
+                }
+            }
+            // A character added without being opened (an import) must be
+            // tracked too: chat bodies are uploaded only for tracked
+            // characters, so its chats would otherwise reach the server as
+            // bodiless stubs. Appended, so the selected-character slot at the
+            // head of the list keeps its meaning.
+            for (const currentCharacterId of currentCharacterIdSet) {
+                if (!knownCharacterIds.has(currentCharacterId) && !changeTracker.character.includes(currentCharacterId)) {
+                    changeTracker.character.push(currentCharacterId)
                 }
             }
             knownCharacterIds = currentCharacterIdSet
@@ -1089,10 +1187,6 @@ export async function saveDb() {
                 }
             }
 
-            encoder = new RisuSaveEncoder()
-            await encoder.init(getDatabase(), {
-                compression: false
-            })
             if (supportsPatchSync) {
                 // Seed from the server's view, not the merged result: the
                 // retry then sends the overlaid local changes as a patch
@@ -1108,6 +1202,7 @@ export async function saveDb() {
 
     async function persistTrackedChanges(
         toSave: toSaveType,
+        timing: SaveTiming,
         options?: {
             forceFullWrite?: boolean
             skipBroadcast?: boolean
@@ -1129,6 +1224,13 @@ export async function saveDb() {
         }
 
         // ── Save changed chat content to server ─────────────────────────
+        let stageAt = performance.now()
+        const lap = () => {
+            const now = performance.now()
+            const ms = Math.round(now - stageAt)
+            stageAt = now
+            return ms
+        }
         const failedChats: { chaId: string, chatId: string, message: string }[] = []
         for (const [chaId, chatId] of collectChatsToPersist(db, toSave)) {
             const char = db.characters.find(c => c.chaId === chaId)
@@ -1150,16 +1252,7 @@ export async function saveDb() {
                 `Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}: ${failedChats[0].message}`
             )
         }
-
-        // ── database.bin: exclude chat payload (stubs only via encoder) ──
-        await encoder.set(db, safeStructuredClone(toSave))
-        const encoded = encoder.encode()
-        if (!encoded) {
-            await sleep(1000)
-            return 'noop'
-        }
-        const dbData = new Uint8Array(encoded)
-        recordDbTransferSize(dbData.byteLength, 'save')
+        timing.chatsMs = lap()
 
         let saved = false
         let newEtag: string | undefined
@@ -1181,7 +1274,9 @@ export async function saveDb() {
         if (supportsPatchSync && !options?.forceFullWrite) {
             syncedArchivedIds = patcher.baselineArchivedCharacterIds()
             syncedBaselineDb = patcher.baselineDb()
+            lap()
             const patchData = await patcher.set(db, safeStructuredClone(toSave))
+            timing.patchSetMs = lap()
             attemptedChangedCharIds = patcher.changedCharacterIdsOfLastSet()
             attemptedIdsAmbiguous = hasAmbiguousCharacterIds(db.characters ?? [])
             // Refuse to send patches that would corrupt server-side lazy chats.
@@ -1203,6 +1298,7 @@ export async function saveDb() {
                     + ` (verbose dump: localStorage.setItem('${CHAT_GUARD_DEBUG_KEY}', '1') then reproduce)`
                 )
                 showChatGuardToastThrottled('client')
+                timing.fullWriteReason = 'chat-guard'
 
                 if (isChatGuardDebugEnabled()) {
                 // ── Diagnostic dump for unknown root cause ────────────────
@@ -1351,7 +1447,16 @@ export async function saveDb() {
                 // device's write.
                 const syncedEtag = forageStorage.getDbEtag()
                 const patchResult = await forageStorage.patchItem('database/database.bin', patchData)
+                timing.patchRequestMs = lap()
+                timing.server = patchResult.serverTimings
                 saved = patchResult.success
+                if (saved) {
+                    // No full encode on a patch save: estimate the full-write
+                    // payload from the patcher's per-entry JSON instead.
+                    recordDbTransferSize(patcher.estimatePayloadBytes(), 'save')
+                } else {
+                    timing.fullWriteReason = 'rejected'
+                }
                 if (patchResult.success && patchResult.etag) {
                     newEtag = patchResult.etag
                     forageStorage.setDbEtag(patchResult.etag)
@@ -1431,6 +1536,18 @@ export async function saveDb() {
             if (supportsPatchSync && !options?.forceFullWrite) {
                 console.warn('[Save] Patch conflict, falling through to full write...')
             }
+            timing.fullWriteReason ??= options?.forceFullWrite ? 'forced' : 'no-patch-sync'
+            // ── database.bin: exclude chat payload (stubs only via encoder) ──
+            // Encoded only here, from a fresh encoder: a patch save never
+            // needs the whole payload, and a fresh init (then set, which adds
+            // the root __directory) cannot carry stale preset/module blocks.
+            lap()
+            const fullEncoder = new RisuSaveEncoder()
+            await fullEncoder.init(db, { compression: false })
+            await fullEncoder.set(db, safeStructuredClone(toSave))
+            const dbData = new Uint8Array(fullEncoder.encode())
+            recordDbTransferSize(dbData.byteLength, 'save')
+            timing.fullEncodeMs = lap()
             const currentEtag = forageStorage.getDbEtag()
             try {
                 await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)
@@ -1453,6 +1570,7 @@ export async function saveDb() {
                 }
                 throw conflictErr
             }
+            timing.fullWriteMs = lap()
 
             // Re-init patcher from the data we just wrote so both sides
             // share the same baseline (including setDatabase defaults).
@@ -1480,17 +1598,33 @@ export async function saveDb() {
         if (saveInFlight) {
             return saveInFlight
         }
+        // Handed off: leave the tracker as it is. Taking and requeueing it
+        // every cycle would hide edits from the unsaved-edits download.
+        if (gotChannel) {
+            return
+        }
 
         const toSave = takeTrackedChanges()
         if (!hasTrackedChanges(toSave) && !options?.forceFullWrite) {
             return
         }
+        const editSeqAtStart = editSeq
 
+        const seq = ++saveSeq
         saveInFlight = (async () => {
             saving.state = true
+            const startedAt = performance.now()
+            const timing = newSaveTiming()
+            const recordSample = (outcome: SaveOutcome) => recordSaveSample({
+                ...timing, at: Date.now(), outcome, totalMs: Math.round(performance.now() - startedAt),
+            })
             try {
-                const result = await persistTrackedChanges(toSave, options)
+                const result = await persistTrackedChanges(toSave, timing, options)
+                if (result === 'saved') recordSample(timing.fullWriteReason ? 'full' : 'patch')
+                else if (result === 'retry') recordSample('retry')
                 if (result === 'saved') {
+                    lastSavedSeq = seq
+                    savedEditSeq = Math.max(savedEditSeq, editSeqAtStart)
                     savetrys = 0
                     consecutiveRetries = 0
                 } else if (result === 'retry') {
@@ -1506,6 +1640,7 @@ export async function saveDb() {
                     changed = true
                 }
             } catch (error) {
+                recordSample('error')
                 requeueTrackedChanges(toSave)
                 if (error instanceof SaveRejectedError) {
                     // Deterministic rejection: the generic backoff below would
@@ -1518,15 +1653,18 @@ export async function saveDb() {
                     return
                 }
                 savetrys += 1
-                if (savetrys > 4) {
-                    alertError(error)
-                    savetrys = 0
-                }
-                else {
-                    console.error(error)
+                console.error(error)
+                if (savetrys < 5) {
                     await sleep(Math.min(500 * savetrys, 3000))
-                    changed = true
+                } else {
+                    // Keep retrying: the changes are requeued, but nothing
+                    // else would start another save until the next edit.
+                    // The wait runs outside saveInFlight so flushSaves is not
+                    // held up by it, and the alert shows once per failure run.
+                    if (savetrys === 5) alertError(error)
+                    saveRetryAt = Date.now() + Math.min(5000 * (savetrys - 4), 30000)
                 }
+                changed = true
             } finally {
                 saving.state = false
                 saveInFlight = null
@@ -1544,25 +1682,42 @@ export async function saveDb() {
         })
     }
 
+    // A save attempt started after the caller's changes, and it succeeded.
+    // triggerSave alone cannot promise that: it hands back a save already in
+    // flight (which may predate the changes) and swallows failures.
+    flushSavesImpl = async () => {
+        await tick()
+        for (let attempt = 0; attempt < 6; attempt++) {
+            if (saveInFlight) {
+                await saveInFlight
+                continue
+            }
+            if (gotChannel) return false // this tab no longer saves
+            const before = saveSeq
+            await triggerSave()
+            if (saveSeq === before) return true // nothing was tracked
+            if (lastSavedSeq === saveSeq) return true
+        }
+        return false
+    }
+
+    trackCharacterForSaveImpl = (chaId) => {
+        if (chaId && !changeTracker.character.includes(chaId)) changeTracker.character.push(chaId)
+    }
+
     let savetrys = 0
+    // After repeated failures the loop waits until this time before retrying.
+    let saveRetryAt = 0
 
     let consecutiveRetries = 0
 
     const MAX_CONSECUTIVE_SAVE_RETRIES = 5
     while (true) {
-        if (!changed) {
+        if (!changed || Date.now() < saveRetryAt) {
             await sleep(200)
             continue
         }
         changed = false
-        if (requiresFullEncoderReload.state) {
-            encoder = new RisuSaveEncoder()
-            await encoder.init(getDatabase(), {
-                compression: false,
-                skipRemoteSavingOnCharacters: false
-            })
-            requiresFullEncoderReload.state = false
-        }
         await triggerSave()
         await sleep(100)
     }
@@ -1723,7 +1878,12 @@ function addFetchLogInGlobalFetch(response: any, success: boolean, url: string, 
     if (!arg.logCategory) return
     const stringify = (value: unknown) => {
         try {
-            return typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+            if (typeof value === 'string') return value
+            // Raw responses (images, audio) are byte arrays: JSON.stringify
+            // writes one key per byte, turning 1MB into tens of MB of text.
+            if (value instanceof ArrayBuffer) return `[ArrayBuffer: ${value.byteLength} bytes]`
+            if (ArrayBuffer.isView(value)) return `[${value.constructor.name}: ${value.byteLength} bytes]`
+            return JSON.stringify(value, null, 2)
         } catch {
             return `${value}`
         }
@@ -2069,28 +2229,28 @@ export function replaceDbResources(db: Database, replacer: { [key: string]: stri
 export function checkCharOrder() {
     let db = getDatabase()
     db.characterOrder = db.characterOrder ?? []
-    let ordered = []
+    const ordered = new Set<string>()
     for (let i = 0; i < db.characterOrder.length; i++) {
         const folder = db.characterOrder[i]
         if (typeof (folder) !== 'string' && folder) {
             for (const f of folder.data) {
-                ordered.push(f)
+                ordered.add(f)
             }
         }
         if (typeof (folder) === 'string') {
-            ordered.push(folder)
+            ordered.add(folder)
         }
     }
 
-    let charIdList: string[] = []
+    const charIdSet = new Set<string>()
 
     for (let i = 0; i < db.characters.length; i++) {
         const char = db.characters[i]
         const charId = char.chaId
         if (!char.trashTime) {
-            charIdList.push(charId)
+            charIdSet.add(charId)
         }
-        if (!ordered.includes(charId)) {
+        if (!ordered.has(charId)) {
             if (charId !== '§temp' && charId !== '§playground' && !char.trashTime) {
                 db.characterOrder.push(charId)
             }
@@ -2102,8 +2262,8 @@ export function checkCharOrder() {
         if (!stub?.chaId) continue
         // Trashed stubs (deactivated + trashedAt) leave the order like trashed characters.
         if (stub.trashedAt) continue
-        charIdList.push(stub.chaId)
-        if (!ordered.includes(stub.chaId)) {
+        charIdSet.add(stub.chaId)
+        if (!ordered.has(stub.chaId)) {
             db.characterOrder.push(stub.chaId)
         }
     }
@@ -2121,7 +2281,7 @@ export function checkCharOrder() {
             // first and fills it afterwards.
             for (let i2 = 0; i2 < data.data.length; i2++) {
                 const data2 = data.data[i2]
-                if (!charIdList.includes(data2)) {
+                if (!charIdSet.has(data2)) {
                     data.data.splice(i2, 1)
                     i2--;
                 }
@@ -2129,7 +2289,7 @@ export function checkCharOrder() {
             db.characterOrder[i] = data
         }
         else {
-            if (!charIdList.includes(data)) {
+            if (!charIdSet.has(data)) {
                 db.characterOrder.splice(i, 1)
                 i--;
             }
@@ -2139,7 +2299,7 @@ export function checkCharOrder() {
     // Sidebar-hidden ids: drop only ids that exist nowhere any more (trashed
     // characters keep their flag so restoring them restores the hidden state).
     if (Array.isArray(db.nodeOnlyHiddenCharacterIds) && db.nodeOnlyHiddenCharacterIds.length > 0) {
-        const known = new Set<string>(charIdList)
+        const known = new Set<string>(charIdSet)
         for (const char of db.characters) {
             if (char?.chaId) known.add(char.chaId)
         }
@@ -3245,18 +3405,18 @@ export function changeChatTo(IdOrIndex: string | number) {
         if(newChat._placeholder){
             const capturedIndex = index
             let cancelled = false
-            loadingOverlayStore.set({ active: true, text: language.loading ?? '', onCancel: () => {
+            const releaseOverlay = claimLoadingOverlay(language.loading ?? '', () => {
                 cancelled = true
                 chatDeselected.set(true)
-                loadingOverlayStore.set({ active: false, text: '', onCancel: null })
-            }})
+                releaseOverlay()
+            })
             void ensureChatHydrated(char.chats, capturedIndex, char.chaId).then((hydrated) => {
                 if(cancelled) return
                 if(hydrated && char.chatPage === capturedIndex) loadTogglesFromChat(hydrated)
             }).catch((e) => {
                 console.error('[changeChatTo] hydration failed:', e)
             }).finally(() => {
-                if(!cancelled) loadingOverlayStore.set({ active: false, text: '', onCancel: null })
+                if(!cancelled) releaseOverlay()
             })
         } else {
             loadTogglesFromChat(newChat)

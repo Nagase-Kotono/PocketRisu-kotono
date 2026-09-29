@@ -313,7 +313,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
-        endGeneration(genKey)
+        endGeneration(genKey, { generationId })
         if (realChatId) clearPendingSend(realChatId)
         return false
     }
@@ -943,7 +943,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            endGeneration(genKey)
+            endGeneration(genKey, { generationId })
             if (realChatId) clearPendingSend(realChatId)
             return false
         }
@@ -1574,6 +1574,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return true
     }
 
+    // Stopped while an earlier stage was still running (possibly force-released
+    // by stopGeneration): do not fire the main request for a dead send.
+    // (Cast keeps TS from narrowing the post-request check below to `false`.)
+    if((abortSignal as AbortSignal).aborted){
+        if (realChatId) clearPendingSend(realChatId)
+        return false
+    }
+
     const req = await requestChatData({
         formated: formated,
         biasString: biases,
@@ -1927,7 +1935,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     if(needsAutoContinue){
-        endGeneration(genKey, { keepPendingAbort: true })
+        endGeneration(genKey, { keepPendingAbort: true, generationId })
         return await sendChat(chatProcessIndex, {
             responseStartedAt,
             chatAdditonalTokens: arg.chatAdditonalTokens,
@@ -1939,14 +1947,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     const igp = risuChatParser(DBState.db.igpPrompt ?? "")
 
-    if(igp){
+    // Stop can land while the output triggers above were still running.
+    if(igp && !abortSignal.aborted){
         const igpFormated = parseChatML(igp)
         const rq = await requestChatData({
             formated: igpFormated,
             bias: {}
         },'emotion', abortSignal)
 
-        DBState.db.characters[selectedChar].chats[selectedChat].message[DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1].data += rq
+        if(!abortSignal.aborted){
+            DBState.db.characters[selectedChar].chats[selectedChat].message[DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1].data += rq
+        }
     }
 
     stageTimings.stage3Duration = Date.now() - stageTimings.stage3Start
@@ -1972,7 +1983,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
         }
         
-        endGeneration(genKey, { keepPendingAbort: true })
+        endGeneration(genKey, { keepPendingAbort: true, generationId })
         return await sendChat(chatProcessIndex, {
             responseStartedAt,
             signal: abortSignal

@@ -59,7 +59,6 @@ export async function loadData() {
                     // setPatchSyncBaseline owns its defensive clone. Cloning at
                     // both call sites briefly held two full DB copies at boot.
                     setPatchSyncBaseline(decoded)
-                    console.log(decoded)
                     setDatabase(decoded)
                     // /api/read serves the chat-stripped blob — the same shape a
                     // full write sends — so its length is a first estimate of the
