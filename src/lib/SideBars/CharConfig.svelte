@@ -193,11 +193,16 @@ import ShButton from "../UI/GUI/ShButton.svelte";
         const char = currentChar()
         if (!char.additionalAssetManifest) return
         if (!manifestPageIsCurrent(char)) return
+        // The row on screen now; another page or a reload may replace it
+        // while the rename is in flight.
+        const row = manifestItems[index]
         try {
             char.additionalAssetManifest = await editAssetManifest(char.additionalAssetManifest, [
                 { type: 'rename', index: manifestOffset + index, name },
             ])
-            await loadCharacterManifestPage(manifestOffset)
+            // Rename in place: reloading the page swapped the whole table for
+            // a loading row, which threw the scroll back to the top.
+            if (row && manifestItems[index] === row) row[0] = name
         } catch (error) {
             if (!await recoverAssetManifestConflict(error, () => loadCharacterManifestPage(0))) throw error
         }

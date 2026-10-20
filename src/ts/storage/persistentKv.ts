@@ -38,9 +38,39 @@ export async function readPersistentJson<T>(storageKey: string): Promise<T | nul
     return JSON.parse(decoder.decode(data)) as T;
 }
 
+// Many keys in one round trip per chunk (bulk read); absent keys are left out
+// of the result. A remote link pays one request instead of one per key.
+export async function readPersistentJsonMany<T>(storageKeys: string[]): Promise<Map<string, T>> {
+    await ensureStorageReady();
+    const out = new Map<string, T>();
+    const CHUNK = 500;
+    for (let i = 0; i < storageKeys.length; i += CHUNK) {
+        const rows = await forageStorage.getItems(storageKeys.slice(i, i + CHUNK));
+        for (const row of rows) {
+            if (!row?.value) continue;
+            try {
+                out.set(row.key, JSON.parse(decoder.decode(row.value)) as T);
+            } catch {
+                // unreadable entry: treat as absent, like a cache miss
+            }
+        }
+    }
+    return out;
+}
+
 export async function writePersistentJson<T>(storageKey: string, value: T): Promise<void> {
     await ensureStorageReady();
     await forageStorage.setItem(storageKey, encoder.encode(JSON.stringify(value)));
+}
+
+export async function readPersistentBytes(storageKey: string): Promise<Uint8Array | null> {
+    await ensureStorageReady();
+    return await forageStorage.getItem(storageKey);
+}
+
+export async function writePersistentBytes(storageKey: string, value: Uint8Array): Promise<void> {
+    await ensureStorageReady();
+    await forageStorage.setItem(storageKey, value);
 }
 
 export async function removePersistentKey(storageKey: string): Promise<void> {
@@ -55,7 +85,12 @@ export async function listPersistentKeys(prefix = ""): Promise<string[]> {
 
 export async function clearPersistentPrefix(prefix: string): Promise<void> {
     const keys = await listPersistentKeys(prefix);
-    await Promise.all(keys.map((key) => removePersistentKey(key)));
+    // A failed delete must not release a clear barrier while other deletes
+    // can still erase values written by the next operation.
+    const results = await Promise.allSettled(keys.map((key) => removePersistentKey(key)));
+    for (const result of results) {
+        if (result.status === 'rejected') throw result.reason;
+    }
 }
 
 export async function makeHashedStorageKey(prefix: string, rawKey: string): Promise<string> {

@@ -1,6 +1,8 @@
 import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
-import { getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
+import { getCurrentChat, getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
+import { resolveClassicModelId } from "src/ts/process/request/modelPresetBinding";
+import { fetchChatFromServer, saveChatToServer } from "src/ts/storage/chatStorage";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import * as pluginStorageStore from "../pluginStorageStore";
@@ -1078,14 +1080,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 DBState.db.characters[charId] = restorePluginCharacterManifest(char, db.characters[charId])
             }
         },
-        getChatFromIndex: (characterIndex:number, chatIndex:number) => {
+        getChatFromIndex: async (characterIndex:number, chatIndex:number) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
             if(charId){
                 const chats = db.characters[charId].chats;
-                if(chats && chats[chatIndex]){
-                    return $state.snapshot(chats[chatIndex]);
+                const slot = chats?.[chatIndex];
+                if(slot){
+                    // A chat not opened yet is only a placeholder here (no
+                    // messages). Hand out the server's copy without loading
+                    // it into the app, like exports do; a fetch error throws.
+                    if(slot._placeholder){
+                        if(!slot.id) return null;
+                        return await fetchChatFromServer(db.characters[charId].chaId, chatIndex, slot.id);
+                    }
+                    return $state.snapshot(slot);
                 }
             }
             return null;
@@ -1133,14 +1143,33 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
             return (await processScriptFull(char, parsed, 'editprocess', chatID, cbsConditions)).data;
         },
-        setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
+        setChatToIndex: async (characterIndex:number, chatIndex:number, chat:any) => {
+            // A placeholder (an unopened chat taken from getCharacter* or
+            // getDatabase) has no messages: writing it back would empty the
+            // chat. Its contents come from getChatFromIndex.
+            if(chat?._placeholder === true){
+                throw new Error('setChatToIndex: this chat is not loaded; read it with getChatFromIndex first');
+            }
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
             if(charId){
                 const chats = db.characters[charId].chats;
                 if(chats && chats[chatIndex]){
+                    // A chat built from scratch keeps the slot's id: the
+                    // server stores chat bodies by id.
+                    if(chat && typeof chat === 'object' && !chat.id && chats[chatIndex].id){
+                        chat.id = chats[chatIndex].id
+                    }
                     DBState.db.characters[charId].chats[chatIndex] = normalizeChat(chat)
+                    // Only the open chat is saved by change tracking; save any
+                    // other chat directly or the write is lost on reload.
+                    const char = DBState.db.characters[charId]
+                    const isOpen = Number(charId) === get(selectedCharID) && char.chatPage === chatIndex
+                    if(!isOpen){
+                        const saved = char.chats[chatIndex]
+                        await saveChatToServer(char.chaId, chatIndex, saved.id, $state.snapshot(saved) as any)
+                    }
                 }
             }
         },
@@ -1578,7 +1607,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 throw new Error("A chat is already in progress");
             }
 
-            if(getModelInfo(DBState.db.aiModel).id.startsWith('pluginmodel:::')){
+            // The model the main request would go to: a plugin provider there
+            // (global or slot-pinned) is blocked; a ModelPreset main is not.
+            const mainModelId = resolveClassicModelId(getCurrentChat(), 'model')
+            if(mainModelId && getModelInfo(mainModelId).id.startsWith('pluginmodel:::')){
                 // Executing plugin provider is block because it can be used for loopholes for ipc right now.
                 throw new Error("Sending chat with plugin-based model is currently blocked");
             }

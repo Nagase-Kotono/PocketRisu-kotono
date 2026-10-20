@@ -25,7 +25,7 @@ const getVips = () => {
     return _vipsPromise
 }
 const { kvGet, kvSet, kvDel, kvList,
-        kvDelPrefix, kvListWithSizes, kvListWithSizesAndUpdatedAt, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
+        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
@@ -76,6 +76,10 @@ let dbCache = {};
 let saveTimers = {};
 const SAVE_INTERVAL = 5000;
 let fullChatStore = null; // Map<chaId, Map<chatId, chatObject>> — lazy-initialized
+// chaId → archivedAt of characters activated in this process whose return to
+// `characters` the client has not saved yet. Their chats live only in
+// fullChatStore until then, so initChatStore carries them over (see there).
+const pendingActivations = new Map();
 const databasePatchHashCache = createPatchHashCache(calculateHash);
 
 // ETag for database.bin
@@ -421,6 +425,7 @@ async function loadDbCacheIfMissing({ createBackup = false } = {}) {
 function invalidateDbCache() {
     delete dbCache[DB_HEX_KEY];
     fullChatStore = null;
+    pendingActivations.clear();
     if (saveTimers[DB_HEX_KEY]) {
         clearTimeout(saveTimers[DB_HEX_KEY]);
         delete saveTimers[DB_HEX_KEY];
@@ -639,7 +644,9 @@ function chatToStub(chat) {
  * reproduce the hybrid on disk.
  */
 function initChatStore(dbObj) {
+    const previous = fullChatStore;
     fullChatStore = new Map();
+    carryPendingActivations(previous, dbObj);
     if (!dbObj?.characters) return;
     for (const char of dbObj.characters) {
         if (!char?.chaId || !char.chats) continue;
@@ -662,6 +669,27 @@ function initChatStore(dbObj) {
         if (charChats.size > 0) {
             fullChatStore.set(char.chaId, charChats);
         }
+    }
+}
+
+// An activated character's chats are registered here before the client's save
+// puts the character back into `characters`. A store rebuild in between (any
+// persist) would drop them: the save that returns the character is then
+// refused as "returned from the archive without activation", and chat bodies
+// posted meanwhile are lost. Keep them while the character is still off the
+// list and its archive stub is the version that was activated; forget the
+// activation once it is listed or the stub is gone or replaced.
+function carryPendingActivations(previous, dbObj) {
+    if (pendingActivations.size === 0) return;
+    const listed = new Set((Array.isArray(dbObj?.characters) ? dbObj.characters : []).map((c) => c?.chaId).filter(Boolean));
+    const stubAt = new Map(archivedStubsOf(dbObj).map((s) => [s.chaId, s.archivedAt]));
+    for (const [chaId, archivedAt] of pendingActivations) {
+        if (listed.has(chaId) || stubAt.get(chaId) !== archivedAt) {
+            pendingActivations.delete(chaId);
+            continue;
+        }
+        const chats = previous?.get(chaId);
+        if (chats) fullChatStore.set(chaId, chats);
     }
 }
 
@@ -1157,7 +1185,13 @@ function shouldCompress(req, res) {
     // 502-avoidance the streaming endpoints were built for. compressible's
     // mime-db happens not to list application/x-ndjson today (so this is
     // a no-op in practice) but a future dep upgrade could flip it on.
+    // Exception: the plugin-storage dump is a bulk transfer the client reads
+    // to the end (no heartbeats), and long-term-memory plugins push it to
+    // hundreds of MB of text — over a remote link gzip pays off (#93).
     if (contentType.includes('application/x-ndjson')) {
+        if (url.split('?')[0] === '/api/plugin-storage/all') {
+            return true;
+        }
         return false;
     }
     // Already-compressed media formats: gzip adds CPU cost with ~0% size gain
@@ -4127,9 +4161,14 @@ app.get('/api/plugin-storage/all', async (req, res, next) => {
             if (closed) return;
             const ok = res.write(JSON.stringify([entry.key, entry.text]) + '\n');
             // Wait for backpressure to clear, but stop if the client went away.
+            // When compressed, the compression middleware forwards 'drain'
+            // listeners to its zlib stream, so remove the listener from the
+            // emitter res.on returned — res.off would leave one behind per
+            // backpressure cycle.
             if (!ok) await new Promise((resolve) => {
-                const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
-                res.once('drain', done);
+                let drainEmitter;
+                const done = () => { drainEmitter.off('drain', done); res.off('close', done); resolve(); };
+                drainEmitter = res.on('drain', done);
                 res.once('close', done);
             });
         }
@@ -7083,6 +7122,7 @@ app.post('/api/characters/:chaId/activate', async (req, res, next) => {
                 charChats.set(chat.id, chat);
             }
             fullChatStore.set(chaId, charChats);
+            pendingActivations.set(chaId, archivedAt);
             // Client view: chats as stubs, asset array as a manifest descriptor.
             // `reconcile` reuses the live manifest when the content is unchanged.
             const clientView = stripDatabaseForClient({ characters: [full] }, { reconcileManifests: true }).characters[0];
@@ -7360,7 +7400,10 @@ function decodeRemoteMetaLastUsed(raw) {
 
 async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemotes = false, checkpointLabel = 'AssetSweep' } = {}) {
     let dbObj;
-    const assets = includeAssets ? kvListWithSizesAndUpdatedAt('assets/') : [];
+    // updated_at is stored after the value BLOB, so reading it walks the whole
+    // value's overflow pages — for every asset that took minutes on a large
+    // library (#102). Only unreferenced candidates need it; it is read below.
+    const assets = includeAssets ? kvListWithSizes('assets/') : [];
     const uncleanable = new Set();
     if (includeAssets) {
         await flushPendingDb();
@@ -7404,7 +7447,7 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
     const assetVictims = includeAssets
         ? assets.filter((it) => {
             if (uncleanable.has(statsBasename(it.key))) return false;
-            if (assetGraceMs > 0 && now - Number(it.updated_at || 0) <= assetGraceMs) return false;
+            if (assetGraceMs > 0 && now - Number(kvGetUpdatedAt(it.key) || 0) <= assetGraceMs) return false;
             return true;
         })
         : [];
@@ -7416,7 +7459,7 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
         const characterIds = new Set(dbObj.characters.map((v) => v?.chaId).filter(Boolean));
         // A deactivated character still owns its remote cache.
         for (const stub of archivedStubsOf(dbObj)) characterIds.add(stub.chaId);
-        const remoteRows = kvListWithSizesAndUpdatedAt('remotes/');
+        const remoteRows = kvListWithSizes('remotes/');
         const remoteByKey = new Map(remoteRows.map((it) => [it.key, it]));
         for (const it of remoteRows) {
             if (it.key.endsWith('.meta')) continue;
@@ -7433,7 +7476,7 @@ async function computeAssetSweep({ includeAssets, assetGraceMs = 0, includeRemot
                 continue;
             }
             const lastUsed = decodeRemoteMetaLastUsed(kvGet(metaKey));
-            const newestUse = Math.max(Number(it.updated_at || 0), lastUsed ?? 0);
+            const newestUse = Math.max(Number(kvGetUpdatedAt(it.key) || 0), lastUsed ?? 0);
             if (now - newestUse > AUTO_SWEEP_GRACE_MS) {
                 remoteVictims.push(it);
                 remoteVictims.push(meta);

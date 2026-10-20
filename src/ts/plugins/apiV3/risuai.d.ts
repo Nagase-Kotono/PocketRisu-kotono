@@ -1064,7 +1064,8 @@ interface PluginStorage {
 }
 
 /**
- * Device-local storage that persists outside of save files.
+ * Server-backed storage shared by devices connected to the same server.
+ * Data is stored separately and is excluded from save-file backups.
  * Uses generic types for flexible value storage.
  * Storage is shared between all plugins under a common prefix.
  *
@@ -1098,7 +1099,10 @@ interface SafeLocalPluginStorage {
     /**
      * Sets an item in storage
      * @param key - Storage key
-     * @param value - Value to store (any JSON-serializable value)
+     * @param value - JSON data, Blob/File, ArrayBuffer, typed arrays, DataView,
+     * Date, Map, Set, RegExp, or BigInt; these may be nested in objects and arrays.
+     * Ordinary values use JSON serialization when no rich types are present.
+     * Unsupported native values reject with DataCloneError.
      * @returns Promise that resolves when item is stored
      */
     setItem<T>(key: string, value: T): Promise<void>;
@@ -1340,6 +1344,11 @@ interface RisuaiPluginAPI {
 
     /**
      * Gets a chat by index
+     *
+     * PocketRisu loads chats lazily: the `chats` arrays returned by
+     * `getCharacter*` / `getDatabase` hold chats that were not opened yet as
+     * placeholders (`_placeholder: true`, empty `message`). This function
+     * always returns the full chat, fetching an unopened one from the server.
      * @param characterIndex - Character index
      * @param chatIndex - Chat index
      * @returns Chat object or null if not found
@@ -1389,6 +1398,10 @@ interface RisuaiPluginAPI {
 
     /**
      * Saves a chat at a specific index
+     *
+     * Rejects a placeholder chat (`_placeholder: true`, see `getChatFromIndex`)
+     * since it has no messages; read the chat with `getChatFromIndex` first.
+     * A chat other than the open one is saved to the server before resolving.
      * @param characterIndex - Character index
      * @param chatIndex - Chat index
      * @param chat - Chat object to save
@@ -1426,8 +1439,8 @@ interface RisuaiPluginAPI {
     safeLocalStorage: SafeLocalStorage;
 
     /**
-     * Gets a device-local storage instance shared between plugins
-     * @returns SafeLocalPluginStorage instance for device-local storage
+     * Gets a server-backed storage instance shared between plugins
+     * @returns SafeLocalPluginStorage instance for storage on the connected server
      *
      * @example
      * ```typescript

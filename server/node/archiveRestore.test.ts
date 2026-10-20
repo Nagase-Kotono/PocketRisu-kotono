@@ -357,3 +357,65 @@ describe('reactivated characters whose chat bodies only the archive rows hold', 
         expect(chat.message).toEqual([{ role: 'user', data: 'newer, on disk' }])
     }, 20_000)
 })
+
+// Activation registers the chats; the client's save then puts the character
+// back into `characters`. A persist in between rebuilt the chat store from a
+// database that did not list the character yet: the registration vanished,
+// the returning save was refused ("returned from the archive without
+// activation") and a chat saved in that window was lost.
+describe('a character activated while a persist runs before it is listed again', () => {
+    it('keeps its chats across the store rebuild and accepts the save that returns it', async () => {
+        await seedDb({
+            characters: [{ chaId: 'other', name: 'Other', type: 'character', image: '', chats: [{ id: 'o1', name: 'o', message: [{ role: 'user', data: 'other' }] }], chatPage: 0 }],
+            characterOrder: ['other', 'back'],
+            nodeOnlyArchivedCharacters: [{ chaId: 'back', name: 'Came back', image: '', archivedAt: 1000, chatCount: 1, chatIds: ['c1'] }],
+        })
+        await writeKey('archive/back/1000', archiveRow('back', 1000, [
+            { id: 'c1', name: 'One', message: [{ role: 'user', data: 'from the row' }] },
+        ]))
+        await readKey('database/database.bin')
+
+        const activated = await fetch(`${base}/api/characters/back/activate`, {
+            method: 'POST', headers: { ...authHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ archivedAt: 1000 }),
+        })
+        expect(activated.status).toBe(200)
+
+        // The returned character's chat is edited before its insert lands…
+        const editBack = await fetch(`${base}/api/chat-content/back/0`, {
+            method: 'POST',
+            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'c1' },
+            body: JSON.stringify({ id: 'c1', name: 'One', message: [{ role: 'user', data: 'from the row' }, { role: 'char', data: 'new reply' }] }),
+        })
+        expect(editBack.status).toBe(200)
+        // …and a persist (debounced after this save) rebuilds the store.
+        const editOther = await fetch(`${base}/api/chat-content/other/0`, {
+            method: 'POST',
+            headers: { ...authHeaders(), 'content-type': 'application/json', 'x-chat-id': 'o1' },
+            body: JSON.stringify({ id: 'o1', name: 'o', message: [{ role: 'user', data: 'other, edited' }] }),
+        })
+        expect(editOther.status).toBe(200)
+        // Wait until that persist has actually written (and rebuilt the store).
+        const deadline = Date.now() + 12_000
+        while (true) {
+            const persisted = (await diskDb()).characters.find((c: any) => c.chaId === 'other')?.chats[0]?.message
+            if (persisted?.[0]?.data === 'other, edited') break
+            if (Date.now() > deadline) throw new Error('debounced persist did not run')
+            await new Promise((resolve) => setTimeout(resolve, 200))
+        }
+
+        // The client's save that lists the character again.
+        await seedDb({
+            characters: [
+                { chaId: 'other', name: 'Other', type: 'character', image: '', chats: [{ id: 'o1', name: 'o', _stub: true }], chatPage: 0 },
+                { chaId: 'back', name: 'Came back', type: 'character', image: '', chats: [{ id: 'c1', name: 'One', _stub: true }], chatPage: 0 },
+            ],
+            characterOrder: ['other', 'back'],
+            nodeOnlyArchivedCharacters: [],
+        })
+
+        const db = await diskDb()
+        expect(db.characters.find((c: any) => c.chaId === 'back').chats[0].message)
+            .toEqual([{ role: 'user', data: 'from the row' }, { role: 'char', data: 'new reply' }])
+        expect(db.characters.find((c: any) => c.chaId === 'other').chats[0].message).toEqual([{ role: 'user', data: 'other, edited' }])
+    }, 20_000)
+})

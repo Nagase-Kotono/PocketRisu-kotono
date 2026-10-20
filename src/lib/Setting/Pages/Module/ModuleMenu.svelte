@@ -82,11 +82,16 @@
 
     async function renameManifestAsset(index: number, name: string) {
         if (!currentModule.assetManifest) return
+        // The row on screen now; another page or a reload may replace it
+        // while the rename is in flight.
+        const row = manifestItems[index]
         try {
             currentModule.assetManifest = await editAssetManifest(currentModule.assetManifest, [
                 { type: 'rename', index: manifestOffset + index, name },
             ])
-            await loadManifestPage(manifestOffset)
+            // Rename in place: reloading the page swapped the whole table for
+            // a loading row, which threw the scroll back to the top.
+            if (row && manifestItems[index] === row) row[0] = name
         } catch (error) {
             if (!await recoverAssetManifestConflict(error, () => loadManifestPage(0))) throw error
         }

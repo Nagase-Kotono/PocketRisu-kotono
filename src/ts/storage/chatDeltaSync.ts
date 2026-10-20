@@ -85,7 +85,28 @@ export function createChatDeltaSync(transport: ChatDeltaTransport, copies: ChatC
         return full
     }
 
-    async function saveChat(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
+    // Saves of one chat run one at a time, in call order: autosave, job
+    // recovery and plugin writes all save through here, and a slower earlier
+    // request finishing last would replace the newer chat on the server.
+    // With nothing in flight a save starts at once, so its content is taken
+    // at the call as before.
+    const saveQueues = new Map<string, Promise<void>>()
+
+    function saveChat(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
+        const key = chatCopyKey(chaId, chatId)
+        const previous = saveQueues.get(key)
+        const run = previous
+            ? previous.then(() => saveChatNow(chaId, chatIndex, chatId, chat))
+            : saveChatNow(chaId, chatIndex, chatId, chat)
+        const settled = run.then(() => {}, () => {})
+        saveQueues.set(key, settled)
+        void settled.then(() => {
+            if (saveQueues.get(key) === settled) saveQueues.delete(key)
+        })
+        return run
+    }
+
+    async function saveChatNow(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
         const key = chatCopyKey(chaId, chatId)
         const messages = chat.message ?? []
         // Fingerprints, delta body and encoding are all taken synchronously

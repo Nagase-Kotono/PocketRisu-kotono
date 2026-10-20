@@ -70,16 +70,19 @@ export async function encodeWithTokenizer(data: string, tokenizerType: string): 
     }
 }
 
-export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Array)>{
+// `modelId`: the classic model to tokenize for — the chat's main model when
+// it differs from the global db.aiModel (a legacy model bound to the slot).
+export async function encode(data:string, modelId?:string):Promise<(number[]|Uint32Array|Int32Array)>{
     const db = getDatabase();
-    const modelInfo = getModelInfo(db.aiModel);
+    const aiModel = modelId || db.aiModel;
+    const modelInfo = getModelInfo(aiModel);
     const pluginTokenizer = pluginV2.providerOptions.get(db.currentPluginProvider)?.tokenizer ?? "none";
 
     let cacheKey = ''
     if(db.useTokenizerCaching){
         cacheKey = getHash(
             data,
-            db.aiModel,
+            aiModel,
             db.customTokenizer,
             db.currentPluginProvider,
             db.googleClaudeTokenizing,
@@ -94,7 +97,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
 
     let result: number[] | Uint32Array | Int32Array;
 
-    if(db.aiModel === 'openrouter' || db.aiModel === 'reverse_proxy'){
+    if(aiModel === 'openrouter' || aiModel === 'reverse_proxy'){
         switch(db.customTokenizer){
             case 'mistral':
                 result = await tokenizeWebTokenizers(data, 'mistral'); break;
@@ -117,7 +120,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
             default:
                 result = await tikJS(data, 'o200k_base'); break;
         }
-    } else if (db.aiModel === 'custom' && pluginTokenizer) {
+    } else if (aiModel === 'custom' && pluginTokenizer) {
         switch(pluginTokenizer){
             case 'mistral':
                 result = await tokenizeWebTokenizers(data, 'mistral'); break;
@@ -163,7 +166,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
         } else if(modelInfo.tokenizer === LLMTokenizer.tiktokenO200Base){
             result = await tikJS(data, 'o200k_base');
         } else if(modelInfo.tokenizer === LLMTokenizer.GoogleCloud && db.googleClaudeTokenizing){
-            result = await tokenizeGoogleCloud(data);
+            result = await tokenizeGoogleCloud(data, aiModel);
         } else if(modelInfo.tokenizer === LLMTokenizer.Gemma || modelInfo.tokenizer === LLMTokenizer.GoogleCloud){
             result = await gemmaTokenize(data);
         } else if(modelInfo.tokenizer === LLMTokenizer.DeepSeek){
@@ -193,9 +196,9 @@ const tokenizersByType = new Map<tokenizerType, Promise<Tokenizer>>()
 
 let googleCloudTokenizedCache = new Map<string, number>()
 
-async function tokenizeGoogleCloud(text:string) {
+async function tokenizeGoogleCloud(text:string, modelId?:string) {
     const db = getDatabase()
-    const model = getModelInfo(db.aiModel)
+    const model = getModelInfo(modelId || db.aiModel)
     const cacheKey = text + model.internalID
 
     if(googleCloudTokenizedCache.has(cacheKey)){
@@ -375,17 +378,21 @@ export class ChatTokenizer {
 
     private chatAdditionalTokens:number
     private useName:'name'|'noName'
+    private modelId?:string
 
-    constructor(chatAdditionalTokens:number, useName:'name'|'noName'){
+    // `modelId`: the classic model the counted prompt is sent to; defaults to
+    // the global db.aiModel inside encode.
+    constructor(chatAdditionalTokens:number, useName:'name'|'noName', modelId?:string){
         this.chatAdditionalTokens = chatAdditionalTokens
         this.useName = useName
+        this.modelId = modelId
     }
     async tokenizeChat(data:OpenAIChat, args:{
         countThoughts?:boolean,
     } = {}) {
-        let encoded = (await encode(data.content)).length + this.chatAdditionalTokens
+        let encoded = (await encode(data.content, this.modelId)).length + this.chatAdditionalTokens
         if(data.name && this.useName ==='name'){
-            encoded += (await encode(data.name)).length + 1
+            encoded += (await encode(data.name, this.modelId)).length + 1
         }
         if(data.multimodals && data.multimodals.length > 0){
             for(const multimodal of data.multimodals){
@@ -394,7 +401,7 @@ export class ChatTokenizer {
         }
         if(data.thoughts && data.thoughts.length > 0 && args.countThoughts){
             for(const thought of data.thoughts){
-                encoded += (await encode(thought)).length + 1
+                encoded += (await encode(thought, this.modelId)).length + 1
             }
         }
         return encoded

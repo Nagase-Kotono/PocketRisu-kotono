@@ -147,3 +147,57 @@ describe('chat delta sync — saving', () => {
         expect(server.stored.message).toEqual([])
     })
 })
+
+describe('chat delta sync — save ordering', () => {
+    // A slow earlier save (a plugin writing an unopened chat) must not land
+    // after a newer one (the autosave after the user opened and edited it).
+    test('saves of the same chat reach the server in call order', async () => {
+        const server = fakeServer(chatOf(3))
+        const order: string[] = []
+        let releaseFirst!: () => void
+        const firstGate = new Promise<void>((r) => { releaseFirst = r })
+        const save = server.transport.saveChatContentDelta as any
+        const real = save.getMockImplementation()
+        save.mockImplementation(async (a: any, i: any, c: any, chat: any, base: any) => {
+            if (chat.note === 'older') await firstGate
+            const out = await real(a, i, c, chat, base)
+            order.push(chat.note)
+            return out
+        })
+        const sync = createChatDeltaSync(server.transport, memoryCopies())
+        const older = sync.saveChat('char', 0, 'chat', chatOf(3, { note: 'older' }))
+        const newer = sync.saveChat('char', 0, 'chat', chatOf(4, { note: 'newer' }))
+        await settle()
+        expect(save).toHaveBeenCalledTimes(1)
+        releaseFirst()
+        await Promise.all([older, newer])
+        expect(order).toEqual(['older', 'newer'])
+        expect(server.stored.note).toBe('newer')
+        expect(server.stored.message).toHaveLength(4)
+    })
+
+    test('a failed save does not block the next one, and other chats are not queued behind it', async () => {
+        const server = fakeServer(chatOf(3))
+        const save = server.transport.saveChatContentDelta as any
+        const real = save.getMockImplementation()
+        save.mockImplementationOnce(async () => { throw new Error('network') })
+        const sync = createChatDeltaSync(server.transport, memoryCopies())
+        const failed = sync.saveChat('char', 0, 'chat', chatOf(3, { note: 'failed' }))
+        const next = sync.saveChat('char', 0, 'chat', chatOf(3, { note: 'next' }))
+        await expect(failed).rejects.toThrow('network')
+        await next
+        expect(server.stored.note).toBe('next')
+
+        let release!: () => void
+        const gate = new Promise<void>((r) => { release = r })
+        save.mockImplementation(async (a: any, i: any, c: any, chat: any, base: any) => {
+            if (c === 'slow') await gate
+            return real(a, i, c, chat, base)
+        })
+        const slow = sync.saveChat('char', 0, 'slow', chatOf(1))
+        await sync.saveChat('char', 0, 'chat', chatOf(3, { note: 'unblocked' }))
+        expect(server.stored.note).toBe('unblocked')
+        release()
+        await slow
+    })
+})
